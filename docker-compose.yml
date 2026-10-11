@@ -1,0 +1,13 @@
+services:
+  flashdb:
+    build: .
+    container_name: flashdb-instance
+    ports:
+      - "6379:6379"
+    volumes:
+      - flashdb_data:/data
+    restart: unless-stopped
+    command: ["--host", "0.0.0.0", "--port", "6379", "--aof", "/data/appendonly.aof", "--aof-policy", "everysec"]
+
+volumes:
+  flashdb_data:

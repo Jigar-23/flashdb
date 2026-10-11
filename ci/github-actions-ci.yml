@@ -1,0 +1,36 @@
+name: FlashDB CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Build, Test & Race Detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Verify Dependencies
+        run: go mod verify
+
+      - name: Run Unit & Integration Tests with Race Detector
+        run: go test -race -v ./...
+
+      - name: Run Memory & CPU Benchmarks
+        run: go test -bench=. -benchmem ./...
+
+      - name: Compile Server & CLI Binaries
+        run: |
+          go build -o bin/flashdb-server ./cmd/flashdb-server
+          go build -o bin/flashdb-cli ./cmd/flashdb-cli

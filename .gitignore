@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and profiles
+*.test
+*.out
+cpu.prof
+mem.prof
+
+# FlashDB data files
+*.aof
+dump.rdb
+data/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
