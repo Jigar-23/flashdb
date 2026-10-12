@@ -1,103 +1,112 @@
-# FlashDB ⚡
+# FlashDB
 
-[![Go Version](https://img.shields.io/badge/go-1.23+-00ADD8.svg?style=flat&logo=go)](https://go.dev/)
-[![Protocol](https://img.shields.io/badge/protocol-RESP%20v2-DC382D.svg?style=flat&logo=redis)](https://redis.io/docs/reference/protocol-spec/)
-[![Throughput](https://img.shields.io/badge/throughput-163k%20ops%2Fsec-success.svg?style=flat)]()
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+A sharded in-memory key-value store in Go with RESP v2 support.
 
-A high-throughput, low-latency in-memory key-value store and cache built from scratch in Go. 
+FlashDB is a lightweight in-memory cache and key-value database built from scratch in Go. It implements the Redis Serialization Protocol (RESP v2), meaning standard Redis tools like `redis-cli` or language client libraries can connect directly over TCP without custom drivers.
 
-FlashDB implements a core command subset using the standard **Redis Serialization Protocol (RESP v2)** wire format, allowing standard Redis clients and CLI tools (`redis-cli`, `redis-benchmark`) to connect directly over TCP without custom protocol drivers.
+I built this project to get hands-on experience with database internals: low-level wire protocol parsing, memory sharding to reduce lock contention under concurrency, cache eviction algorithms, and crash durability with append-only logs.
 
 ---
 
-## 🏛️ System Architecture
+## Architecture
 
 ```
                       +-----------------------------+
                       |   Standard Redis Clients    |
-                      | (redis-cli, apps, SDKs)     |
+                      | (redis-cli, redis-benchmark)|
                       +--------------+--------------+
                                      |  TCP (Port 6379)
                                      v
                       +-----------------------------+
                       |     TCP Socket Listener     |
-                      |   (Goroutine Pool + RESP)   |
+                      |    (Goroutine per conn)     |
                       +--------------+--------------+
                                      |
-               +---------------------+---------------------+
-               |                                           |
-               v                                           v
-+-------------------------------+             +---------------------------+
-|    RESP v2 Streaming Parser   |             |   Command Router & Dispatcher |
-|     (Buffered bufio Engine)   |             |   (Type/Argument Validator)|
-+--------------+----------------+             +-------------+-------------+
-               |                                           |
-               +---------------------+---------------------+
+                                     v
+                      +-----------------------------+
+                      |   RESP v2 Streaming Parser  |
+                      |   (Buffered bufio Reader)   |
+                      +--------------+--------------+
                                      |
                                      v
-                 +---------------------------------------+
-                 |       64-Shard Memory Engine          |
-                 |  (FNV-1a Hashed Concurrency Shards)   |
-                 +-------------------+-------------------+
+                      +-----------------------------+
+                      |       Command Router        |
+                      +--------------+--------------+
+                                     |
+                                     v
+                      +-----------------------------+
+                      |       64-Shard Engine       |
+                      |    (FNV-1a Hash Shards)     |
+                      +--------------+--------------+
                                      |
          +---------------------------+---------------------------+
          |                           |                           |
          v                           v                           v
 +-----------------+         +------------------+        +-----------------+
-|     O(1) LRU    |         |   Millisecond    |        |  Append-Only    |
-| Eviction Engine |         |  TTL Expiration  |        |  File (AOF)     |
-| (DLL + HashMap) |         | (Active/Passive) |        |  Durability     |
+|     O(1) LRU    |         |   TTL Sweeper    |        |  Append-Only    |
+| Eviction Engine |         | (Active/Passive) |        |  File (AOF)     |
+| (DLL + HashMap) |         |                  |        |  Durability     |
 +-----------------+         +------------------+        +-----------------+
 ```
 
 ---
 
-## 🚀 Key Engineering Highlights
+## How It Works
 
-### 1. 64-Shard Partitioned Memory Model
-* **The Problem:** A single global `sync.RWMutex` over a central hash table causes severe CPU core contention when thousands of concurrent goroutines perform writes.
-* **The Solution:** FlashDB splits memory into **64 independent shards** using FNV-1a hash distribution (`hash(key) % 64`). Writes to different keys acquire isolated shard locks without waiting on each other, unlocking near-linear multi-core CPU scaling.
+### 1. 64-Shard Partitioned Memory
+Using a single global `sync.RWMutex` around an in-memory map creates heavy lock contention when dozens of concurrent client connections perform writes. 
 
-### 2. Streaming RESP v2 Wire Protocol
-* Built on top of `bufio.Reader` and streaming byte parsers, the protocol engine decodes Simple Strings (`+`), Errors (`-`), Integers (`:`), Bulk Strings (`$`), and Arrays (`*`) directly from the TCP socket buffer into typed commands.
+FlashDB partitions its keyspace across 64 independent shards using an FNV-1a hash (`hash(key) % 64`). Each shard maintains its own `sync.RWMutex`. Writes to different keys acquire independent shard locks, allowing concurrent goroutines to write in parallel without blocking each other.
 
-### 3. $O(1)$ LRU Eviction Engine
-* Implements a custom Doubly Linked List paired with a pointer index map. Cache access, eviction, and removals operate in strict **$O(1)$ time complexity**.
-* Configurable memory caps (`--maxmemory`) automatically trigger LRU eviction on `SET` operations when limits are reached.
+### 2. Streaming RESP v2 Parser
+Instead of using external frameworks or HTTP, the server parses raw TCP byte streams directly using `bufio.Reader`. It decodes the core RESP v2 data types:
+* Simple Strings (`+`)
+* Errors (`-`)
+* Integers (`:`)
+* Bulk Strings (`$`)
+* Arrays (`*`)
 
-### 4. Active & Passive TTL Expiration
-* **Passive Expiration:** Expired keys are lazily pruned upon read operations (`GET`, `EXISTS`).
-* **Active Background Sweeper:** A periodic background routine probabilistically samples random keys from shards and clears expired entries (Redis-style adaptive sweep), ensuring memory is reclaimed even if keys are never accessed again.
+### 3. O(1) LRU Eviction
+When `--maxmemory` is configured, adding new keys beyond the threshold triggers eviction. Eviction is handled by a doubly linked list paired with a hash map lookup:
+* Cache hits move elements to the head in $O(1)$ time.
+* When memory is exhausted, the tail element is evicted in $O(1)$ time.
 
-### 5. Crash Durability: Append-Only File (AOF) & Rewrite Compaction
-* Logs all mutating state commands into an Append-Only File with configurable `fsync` policies:
-  * `always`: Synchronous disk commit on every operation.
-  * `everysec`: Background disk commit every 1000ms.
-  * `no`: OS buffer flush.
-* **AOF Compaction:** Supports live background rewrite (`REWRITEAOF`), taking an in-memory snapshot and collapsing millions of incremental modifications into minimal state-setting commands.
+### 4. Active and Passive TTL Expiration
+* **Passive expiration:** Keys are checked when accessed (`GET`, `EXISTS`). If expired, they are deleted on the fly and reported as non-existent.
+* **Active background sweeper:** A background goroutine wakes up every 100ms, selects a random shard, samples up to 20 keys with TTLs, and removes any expired ones. This prevents keys that are never read again from leaking memory.
+
+### 5. Append-Only File (AOF) & Rewrite Compaction
+* Every mutating command is written to an append-only log with configurable `fsync` policies (`always`, `everysec`, or `no`).
+* On restart, the engine replays the AOF file sequentially to rebuild the in-memory state.
+* **AOF Compaction:** Running `REWRITEAOF` takes an in-memory snapshot of all active keys and rewrites the log with minimal `SET` statements, collapsing redundant updates into a compact file.
 
 ---
 
-## 📊 Performance Benchmarks
+## Benchmarks
 
-Benchmarked locally on Apple Silicon (M-series, Darwin arm64) using `flashdb-cli` over TCP:
+Benchmarked locally on an Apple M-series Mac (Darwin arm64) over TCP loopback using the built-in benchmark runner:
+
+```bash
+./bin/flashdb-cli --bench -p 6379 -c 50 -n 50000
+```
 
 | Metric | Result |
 | :--- | :--- |
-| **Throughput** | **~158,000 – 163,000 operations / sec** |
-| **Duration (50k ops)** | **~0.31 – 0.32 seconds** |
-| **Concurrent Clients** | 50 clients |
-| **Latency (p50)** | **~200 – 210 µs** (0.20 ms) |
-| **Latency (p95)** | **~770 – 800 µs** (0.78 ms) |
-| **Latency (p99)** | **~1.3 – 1.6 ms** |
+| **Throughput** | ~158,000 – 163,000 ops/sec |
+| **Duration (50,000 ops)** | ~0.31 – 0.32 s |
+| **Concurrency** | 50 clients |
+| **Latency p50** | ~0.20 ms (203 µs) |
+| **Latency p95** | ~0.79 ms (797 µs) |
+| **Latency p99** | ~1.37 ms |
+
+*(Note: These figures reflect local loopback testing. In production, network transit and disk fsync settings will dictate overall latency.)*
 
 ---
 
-## 🛠️ Supported Commands
+## Supported Commands
 
-* **Connection & Server:** `PING`, `ECHO`, `INFO`, `DBSIZE`, `FLUSHDB`, `COMMAND`, `REWRITEAOF`
-* **Key Management:** `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
+* **Server & Utility:** `PING`, `ECHO`, `INFO`, `DBSIZE`, `FLUSHDB`, `COMMAND`, `REWRITEAOF`
+* **Keys:** `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
 * **Strings:** `SET [EX seconds] [PX millis]`, `GET`, `MSET`, `MGET`, `INCR`, `DECR`, `APPEND`, `STRLEN`
 * **Lists:** `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`
 * **Hashes:** `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`
@@ -105,55 +114,71 @@ Benchmarked locally on Apple Silicon (M-series, Darwin arm64) using `flashdb-cli
 
 ---
 
-## 💻 Quickstart
+## Getting Started
 
-### 1. Run with Docker Compose
-```bash
-docker compose up -d
-```
+### Prerequisites
+* Go 1.23 or newer
+* (Optional) `redis-cli` for testing connections
+* (Optional) Docker
 
-### 2. Run Directly from Source
-```bash
-# Build binaries
-make build
+### Build and Run
 
-# Start FlashDB Server on port 6379
-./bin/flashdb-server --port 6379
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/Jigar-23/flashdb.git
+   cd flashdb
+   ```
 
-# In another terminal, connect using official redis-cli
-redis-cli -p 6379
-127.0.0.1:6379> SET user:1 "Alice"
-OK
-127.0.0.1:6379> GET user:1
-"Alice"
-127.0.0.1:6379> INCR visitor_counter
-(integer) 1
-```
+2. **Build the server and CLI:**
+   ```bash
+   make build
+   ```
 
-### 3. Run High-Speed Benchmark
-```bash
-./bin/flashdb-cli --bench -p 6379 -c 50 -n 50000
-```
+3. **Start the server:**
+   ```bash
+   ./bin/flashdb-server --port 6379
+   ```
 
-### 4. Run Tests & Race Detector
-```bash
-make test-race
-```
+4. **Connect using standard `redis-cli`:**
+   ```bash
+   redis-cli -p 6379
+   127.0.0.1:6379> SET name "FlashDB"
+   OK
+   127.0.0.1:6379> GET name
+   "FlashDB"
+   127.0.0.1:6379> INCR counter
+   (integer) 1
+   ```
 
----
+5. **Run tests and race detector:**
+   ```bash
+   make test-race
+   ```
 
-## ⚖️ Design Decisions & Trade-Offs
-
-1. **Why 64 Shards instead of `sync.Map`?**  
-   Go's built-in `sync.Map` is optimized for append-only or read-heavy workloads where keys are rarely updated. In a high-throughput cache with frequent `SET`, `DEL`, and `EXPIRE` mutations, a partitioned array of 64 mutex-protected maps consistently outperforms `sync.Map` by over 40% due to deterministic cache locality and isolated lock domains.
-
-2. **Why RESP v2 instead of gRPC/Protobuf?**  
-   Adhering to RESP v2 ensures wire compatibility with standard Redis tooling for supported commands, demonstrating low-level TCP socket parsing, byte manipulation, and network framing without third-party RPC frameworks.
-
-3. **Why AOF over RDB?**  
-   AOF gives finer granularity for crash durability without requiring expensive process fork (`fork()`) memory copying, which can cause severe latency spikes on memory-constrained servers.
+6. **Run with Docker Compose:**
+   ```bash
+   docker compose up -d
+   ```
 
 ---
 
-## 📄 License
-MIT License. Created by [Jigar](https://github.com/Jigar-23).
+## Design Decisions & Trade-Offs
+
+* **64 Shards vs. `sync.Map`:** Go's `sync.Map` works well for append-only or cache-read workloads with few updates. For an in-memory cache with frequent `SET`, `DEL`, and `EXPIRE` writes, partitioned maps with per-shard `RWMutex` significantly reduce lock contention.
+* **RESP v2 Wire Format vs. JSON/Protobuf:** Implementing RESP keeps the server compatible with the existing Redis ecosystem, allowing testing with official tools like `redis-cli` and `redis-benchmark`.
+* **AOF vs. RDB Snapshots:** AOF provides straightforward durability without needing `fork()`. In Go, forking a process can be tricky with runtime threads and goroutines, making an append-only log with snapshot rewrite a cleaner fit.
+
+---
+
+## Scope & Limitations
+
+To be clear about what this project is and isn't:
+* This is a focused implementation of core Redis commands, not a full 1:1 replacement. Features like Redis Pub/Sub, Lua scripting, transactions (`MULTI`/`EXEC`), and cluster replication are not implemented.
+* Sharding is strictly in-process across CPU cores, not distributed across multiple nodes.
+* Memory estimation for LRU tracks raw payload sizes rather than low-level Go allocator overhead.
+
+---
+
+## License
+
+MIT License. Built by [Jigar](https://github.com/Jigar-23).
