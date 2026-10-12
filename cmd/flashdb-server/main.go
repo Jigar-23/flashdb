@@ -30,7 +30,7 @@ func main() {
 
 	flag.Parse()
 
-	fmt.Println(Banner)
+	fmt.Print(Banner)
 	log.Printf("[FlashDB] Initializing on %s:%d (AOF: %s, Policy: %s)\n", *host, *port, *aofPath, *aofPolicy)
 
 	srv, err := server.NewServer(server.Config{
