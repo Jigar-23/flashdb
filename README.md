@@ -7,7 +7,7 @@
 
 A high-throughput, low-latency in-memory key-value store and cache built from scratch in Go. 
 
-FlashDB implements the standard **Redis Serialization Protocol (RESP v2)**, allowing standard Redis clients (including `redis-cli`, `redis-benchmark`, Python `redis-py`, and Node `ioredis`) to connect and interact directly without translation layers.
+FlashDB implements a core command subset using the standard **Redis Serialization Protocol (RESP v2)** wire format, allowing standard Redis clients and CLI tools (`redis-cli`, `redis-benchmark`) to connect directly over TCP without custom protocol drivers.
 
 ---
 
@@ -30,7 +30,7 @@ FlashDB implements the standard **Redis Serialization Protocol (RESP v2)**, allo
                v                                           v
 +-------------------------------+             +---------------------------+
 |    RESP v2 Streaming Parser   |             |   Command Router & Auth   |
-|   (Zero-Allocation bufio)     |             |   (Type/Argument Validator)|
+|     (Buffered bufio Engine)   |             |   (Type/Argument Validator)|
 +--------------+----------------+             +-------------+-------------+
                |                                           |
                +---------------------+---------------------+
@@ -59,8 +59,8 @@ FlashDB implements the standard **Redis Serialization Protocol (RESP v2)**, allo
 * **The Problem:** A single global `sync.RWMutex` over a central hash table causes severe CPU core contention when thousands of concurrent goroutines perform writes.
 * **The Solution:** FlashDB splits memory into **64 independent shards** using FNV-1a hash distribution (`hash(key) % 64`). Writes to different keys acquire isolated shard locks without waiting on each other, unlocking near-linear multi-core CPU scaling.
 
-### 2. Zero-Allocation RESP v2 Wire Protocol
-* Built on top of `bufio.Reader` and streaming byte evaluators, the parser decodes Simple Strings (`+`), Errors (`-`), Integers (`:`), Bulk Strings (`$`), and Arrays (`*`) without creating unnecessary heap allocations or triggering Go garbage collection pauses.
+### 2. Streaming RESP v2 Wire Protocol
+* Built on top of `bufio.Reader` and streaming byte parsers, the protocol engine decodes Simple Strings (`+`), Errors (`-`), Integers (`:`), Bulk Strings (`$`), and Arrays (`*`) directly from the TCP socket buffer into typed commands.
 
 ### 3. $O(1)$ LRU & LFU Eviction Engine
 * Implements a custom Doubly Linked List paired with a pointer index map. Cache access, eviction, and removals operate in strict **$O(1)$ time complexity**.
@@ -85,12 +85,12 @@ Benchmarked locally on Apple Silicon (M-series, Darwin arm64) using `flashdb-cli
 
 | Metric | Result |
 | :--- | :--- |
-| **Throughput** | **163,129 operations / sec** |
-| **Duration (50k ops)** | **0.31 seconds** |
+| **Throughput** | **~158,000 – 163,000 operations / sec** |
+| **Duration (50k ops)** | **~0.31 – 0.32 seconds** |
 | **Concurrent Clients** | 50 clients |
-| **Latency (p50)** | **202 µs** (0.20 ms) |
-| **Latency (p95)** | **777 µs** (0.77 ms) |
-| **Latency (p99)** | **1.63 ms** |
+| **Latency (p50)** | **~200 – 210 µs** (0.20 ms) |
+| **Latency (p95)** | **~770 – 800 µs** (0.78 ms) |
+| **Latency (p99)** | **~1.3 – 1.6 ms** |
 
 ---
 
@@ -148,7 +148,7 @@ make test-race
    Go's built-in `sync.Map` is optimized for append-only or read-heavy workloads where keys are rarely updated. In a high-throughput cache with frequent `SET`, `DEL`, and `EXPIRE` mutations, a partitioned array of 64 mutex-protected maps consistently outperforms `sync.Map` by over 40% due to deterministic cache locality and isolated lock domains.
 
 2. **Why RESP v2 instead of gRPC/Protobuf?**  
-   Adhering to RESP v2 ensures FlashDB is a drop-in replacement for any Redis client in any language. It also tests low-level TCP stream parsing, byte manipulation, and wire-level framing that binary RPC wrappers abstract away.
+   Adhering to RESP v2 ensures wire compatibility with standard Redis tooling for supported commands, demonstrating low-level TCP socket parsing, byte manipulation, and network framing without third-party RPC frameworks.
 
 3. **Why AOF over RDB?**  
    AOF gives finer granularity for crash durability without requiring expensive process fork (`fork()`) memory copying, which can cause severe latency spikes on memory-constrained servers.
