@@ -21,7 +21,7 @@ type Entry struct {
 	CreatedAt    int64 // Unix millis
 	ExpiresAt    int64 // Unix millis (0 = no expiration)
 	LastAccessed int64 // Unix millis
-	AccessCount  int64 // For LFU
+	AccessCount  int64 // Key access counter
 	Size         int64 // Estimated memory size in bytes
 }
 

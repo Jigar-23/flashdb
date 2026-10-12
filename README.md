@@ -29,7 +29,7 @@ FlashDB implements a core command subset using the standard **Redis Serializatio
                |                                           |
                v                                           v
 +-------------------------------+             +---------------------------+
-|    RESP v2 Streaming Parser   |             |   Command Router & Auth   |
+|    RESP v2 Streaming Parser   |             |   Command Router & Dispatcher |
 |     (Buffered bufio Engine)   |             |   (Type/Argument Validator)|
 +--------------+----------------+             +-------------+-------------+
                |                                           |
@@ -45,7 +45,7 @@ FlashDB implements a core command subset using the standard **Redis Serializatio
          |                           |                           |
          v                           v                           v
 +-----------------+         +------------------+        +-----------------+
-|   O(1) LRU/LFU  |         |   Millisecond    |        |  Append-Only    |
+|     O(1) LRU    |         |   Millisecond    |        |  Append-Only    |
 | Eviction Engine |         |  TTL Expiration  |        |  File (AOF)     |
 | (DLL + HashMap) |         | (Active/Passive) |        |  Durability     |
 +-----------------+         +------------------+        +-----------------+
@@ -62,7 +62,7 @@ FlashDB implements a core command subset using the standard **Redis Serializatio
 ### 2. Streaming RESP v2 Wire Protocol
 * Built on top of `bufio.Reader` and streaming byte parsers, the protocol engine decodes Simple Strings (`+`), Errors (`-`), Integers (`:`), Bulk Strings (`$`), and Arrays (`*`) directly from the TCP socket buffer into typed commands.
 
-### 3. $O(1)$ LRU & LFU Eviction Engine
+### 3. $O(1)$ LRU Eviction Engine
 * Implements a custom Doubly Linked List paired with a pointer index map. Cache access, eviction, and removals operate in strict **$O(1)$ time complexity**.
 * Configurable memory caps (`--maxmemory`) automatically trigger LRU eviction on `SET` operations when limits are reached.
 
